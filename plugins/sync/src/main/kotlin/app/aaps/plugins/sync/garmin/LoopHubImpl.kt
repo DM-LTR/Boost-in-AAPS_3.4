@@ -5,6 +5,7 @@ import app.aaps.core.data.model.GV
 import app.aaps.core.data.model.GlucoseUnit
 import app.aaps.core.data.model.HR
 import app.aaps.core.data.model.RM
+import app.aaps.core.data.model.SC
 import app.aaps.core.data.model.TE
 import app.aaps.core.data.ue.Action
 import app.aaps.core.data.ue.Sources
@@ -81,6 +82,35 @@ class LoopHubImpl @Inject constructor(
 
     /** Returns true if the pump is connected. */
     override val isConnected: Boolean get() = loop.runningMode != RM.Mode.DISCONNECTED_PUMP
+
+    /** Short loop status for the watch face. */
+    override val loopStatus: String
+        get() = when (loop.runningMode) {
+            RM.Mode.CLOSED_LOOP       -> "CLOSED"
+            RM.Mode.CLOSED_LOOP_LGS   -> "LGS"
+            RM.Mode.OPEN_LOOP         -> "OPEN"
+            RM.Mode.DISABLED_LOOP     -> "DISABLED"
+            RM.Mode.SUPER_BOLUS       -> "SUPERBOLUS"
+            RM.Mode.DISCONNECTED_PUMP -> "DISCONN"
+            RM.Mode.SUSPENDED_BY_PUMP,
+            RM.Mode.SUSPENDED_BY_USER,
+            RM.Mode.SUSPENDED_BY_DST  -> "SUSPEND"
+            else                      -> "LOOP"   // RESUME / any transient or future mode
+        }
+
+    /** Epoch-ms of the last APS run (loop freshness), or null if it has never run. */
+    override val lastLoopEpochMs: Long?
+        get() = loop.lastRun?.lastAPSRun
+
+    /** Current DynISF / variable sensitivity in the user's glucose units. Prefer the live APS
+     *  variable_sens; fall back to the profile ISF; null if neither is available. */
+    override val variableSensInUnits: Double?
+        get() {
+            val mgdl = loop.lastRun?.constraintsProcessed?.variableSens
+                ?: currentProfile?.getIsfMgdl("GarminLoopHub")
+                ?: return null
+            return profileUtil.fromMgdlToUnits(mgdl, glucoseUnit)
+        }
 
     /** Returns true if the current profile is set of a limited amount of time. */
     override val isTemporaryProfile: Boolean
@@ -167,5 +197,48 @@ class LoopHubImpl @Inject constructor(
             device = device ?: "Garmin",
         )
         disposable += persistenceLayer.insertOrUpdateHeartRate(hr).subscribe()
+    }
+
+    override fun storeSteps(
+        timestampMs: Long,
+        steps5min: Int, steps10min: Int, steps15min: Int,
+        steps30min: Int, steps60min: Int, steps180min: Int,
+        device: String?
+    ) {
+        if (timestampMs <= 0L) return
+        // A trailing-window count has a physical ceiling; above about 200 steps a minute it is a
+        // cumulative counter rather than a window. A Venu 3 sent 1919 in all six windows at once on
+        // 2026-08-27, which the activity classifier reads as six times a brisk walk and treats as
+        // continuous exercise. See GarminStepWindows.
+        val w = GarminStepWindows.sanitise(
+            steps5min, steps10min, steps15min, steps30min, steps60min, steps180min
+        )
+        val sc = SC(
+            duration = 300_000L,          // 5-min snapshot (mirrors the wear cadence)
+            timestamp = timestampMs,
+            steps5min = w.s5, steps10min = w.s10, steps15min = w.s15,
+            steps30min = w.s30, steps60min = w.s60, steps180min = w.s180,
+            device = device ?: "Garmin",
+            dateCreated = clock.millis(),
+        )
+        disposable += persistenceLayer.insertOrUpdateStepsCount(sc).subscribe()
+    }
+
+    override fun storeHeartRates(samples: List<Pair<Long, Int>>, device: String?) {
+        // Correct HR-model convention: timestamp = END of the minute, duration = 60 000 (matches
+        // HealthConnectHrIngest so overlapping rows dedupe by minute bucket). insertOrUpdate is
+        // idempotent, so a backfill batch on BT reconnect is safe to replay.
+        val dev = device ?: "Garmin"
+        for ((endMs, bpm) in samples) {
+            if (bpm <= 10 || endMs <= 0L) continue
+            val hr = HR(
+                timestamp = endMs,
+                duration = 60_000L,
+                dateCreated = clock.millis(),
+                beatsPerMinute = bpm.toDouble(),
+                device = dev,
+            )
+            disposable += persistenceLayer.insertOrUpdateHeartRate(hr).subscribe()
+        }
     }
 }
